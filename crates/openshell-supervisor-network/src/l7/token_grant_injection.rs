@@ -454,6 +454,13 @@ pub mod test_support {
             self.resolver.clone()
         }
 
+        pub fn request_count(&self) -> usize {
+            self.requests
+                .lock()
+                .expect("fake token grant requests lock poisoned")
+                .len()
+        }
+
         pub fn assert_no_requests(&self) {
             let requests = self
                 .requests

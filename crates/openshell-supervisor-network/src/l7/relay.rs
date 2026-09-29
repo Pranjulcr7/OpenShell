@@ -10209,6 +10209,133 @@ network_policies:
         }
     }
 
+    fn token_grant_mcp_endpoint_context(
+        protocol: &str,
+    ) -> (
+        (L7EndpointConfig, TunnelPolicyEngine, L7EvalContext),
+        crate::l7::token_grant_injection::test_support::TokenGrantTestFixture,
+    ) {
+        let rules = match protocol {
+            "rest" => {
+                r#"
+        rules:
+          - allow:
+              method: POST
+              path: /mcp
+"#
+            }
+            "mcp" => {
+                r#"
+        mcp:
+          versions: ["2025-03-26"]
+        rules:
+          - allow:
+              method: tools/call
+              tool: read_status
+        deny_rules:
+          - method: tools/call
+            tool: delete_resource
+"#
+            }
+            _ => panic!("unsupported fixture protocol: {protocol}"),
+        };
+        let data = format!(
+            r#"
+network_policies:
+  mcp_api:
+    name: mcp_api
+    endpoints:
+      - host: mcp.example.test
+        port: 8000
+        path: /mcp
+        protocol: {protocol}
+        enforcement: enforce
+{rules}
+    binaries:
+      - {{ path: /usr/bin/python3 }}
+"#
+        );
+        let (config, engine, mut ctx) = mcp_relay_context_from_data(&data);
+        let fixture =
+            crate::l7::token_grant_injection::test_support::TokenGrantTestFixture::success(
+                "mcp.example.test\t8000\t/mcp\tprovider:access_token",
+                "grant-token",
+            );
+        ctx.dynamic_credentials = Some(fixture.dynamic_credentials());
+        ctx.token_grant_resolver = Some(fixture.resolver());
+        ((config, engine, ctx), fixture)
+    }
+
+    async fn assert_token_grant_on_admitted_mcp_endpoint(protocol: &str) {
+        let (context, fixture) = token_grant_mcp_endpoint_context(protocol);
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_status","arguments":{}}}"#;
+        let (response, forwarded) = run_mcp_relay_case(
+            context,
+            false,
+            "MCP-Protocol-Version: 2025-03-26\r\n",
+            body,
+            "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(
+            response.starts_with("HTTP/1.1 204 No Content\r\n"),
+            "{response}"
+        );
+        let forwarded = String::from_utf8(forwarded).unwrap();
+        let (headers, forwarded_body) = forwarded.split_once("\r\n\r\n").unwrap();
+        assert_eq!(forwarded_body, body);
+        let authorization: Vec<_> = headers
+            .lines()
+            .filter_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("authorization")
+                    .then(|| value.trim())
+            })
+            .collect();
+        let grant_requests = fixture.request_count();
+        eprintln!(
+            "protocol={protocol}: status=204, body_preserved=true, grant_requests={grant_requests}, authorization_headers={}",
+            authorization.len()
+        );
+        assert_eq!(
+            grant_requests, 1,
+            "admitted {protocol} request must resolve its token grant"
+        );
+        fixture.assert_one_request("mcp.example.test\t8000\t/mcp\tprovider:access_token");
+        assert_eq!(authorization, ["Bearer grant-token"]);
+    }
+
+    #[tokio::test]
+    async fn l7_token_grant_rest_control_injects_on_same_endpoint() {
+        assert_token_grant_on_admitted_mcp_endpoint("rest").await;
+    }
+
+    #[tokio::test]
+    async fn l7_token_grant_mcp_admitted_call_injects_authorization() {
+        assert_token_grant_on_admitted_mcp_endpoint("mcp").await;
+    }
+
+    #[tokio::test]
+    async fn l7_token_grant_mcp_denied_call_does_not_resolve_or_forward() {
+        let (context, fixture) = token_grant_mcp_endpoint_context("mcp");
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"delete_resource","arguments":{}}}"#;
+        let (response, forwarded) = run_mcp_relay_case(
+            context,
+            false,
+            "MCP-Protocol-Version: 2025-03-26\r\n",
+            body,
+            "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(
+            response.starts_with("HTTP/1.1 403 Forbidden\r\n"),
+            "{response}"
+        );
+        assert!(forwarded.is_empty(), "denied tool call reached upstream");
+        fixture.assert_no_requests();
+        eprintln!("protocol=mcp: status=403, forwarded_bytes=0, grant_requests=0");
+    }
+
     async fn run_mcp_relay_case(
         context: (L7EndpointConfig, TunnelPolicyEngine, L7EvalContext),
         route_selected: bool,
