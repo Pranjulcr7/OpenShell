@@ -52,6 +52,13 @@ struct ConfigArgs {
 
 #[derive(clap::Subcommand, Debug)]
 enum ConfigCommand {
+    /// Print a configuration with legacy plaintext and anonymous access disabled.
+    /// Used by package hooks; the source file is never modified.
+    MigrateMtls {
+        /// Configuration file to migrate.
+        #[arg(long)]
+        path: PathBuf,
+    },
     /// Validate the selected configuration without modifying it or starting the gateway.
     Preflight(ConfigPreflightArgs),
 }
@@ -286,6 +293,17 @@ pub async fn run_cli_with_compute_drivers(compute_drivers: ComputeDriverRegistry
     match cli.command {
         Some(Commands::GenerateCerts(args)) => certgen::run(args).await,
         Some(Commands::Config(args)) => match args.command {
+            ConfigCommand::MigrateMtls { path } => {
+                let input = std::fs::read_to_string(&path).map_err(|error| {
+                    miette::miette!("failed to read {}: {error}", path.display())
+                })?;
+                let output = crate::config_migration::migrate_mtls(&input).map_err(|_| {
+                    // TOML errors can include source lines containing secrets.
+                    miette::miette!("failed to migrate {}: invalid TOML", path.display())
+                })?;
+                std::io::Write::write_all(&mut std::io::stdout().lock(), output.as_bytes())
+                    .map_err(|error| miette::miette!("failed to write migrated config: {error}"))
+            }
             ConfigCommand::Preflight(args) => {
                 run_config_preflight_with_drivers(args, cli.run, &matches, &compute_drivers)
             }
@@ -1836,6 +1854,29 @@ mod tests {
             cli.command,
             Some(super::Commands::GenerateCerts(_))
         ));
+    }
+
+    #[test]
+    fn config_migrate_mtls_requires_an_explicit_path() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _db = EnvVarGuard::remove("OPENSHELL_DB_URL");
+        let _config = EnvVarGuard::remove("OPENSHELL_GATEWAY_CONFIG");
+        let cli = Cli::try_parse_from([
+            "openshell-gateway",
+            "config",
+            "migrate-mtls",
+            "--path",
+            "/tmp/gateway.toml",
+        ])
+        .expect("migration should parse without runtime arguments");
+        assert!(matches!(cli.command,
+            Some(super::Commands::Config(super::ConfigArgs {
+                command: super::ConfigCommand::MigrateMtls { path }
+            })) if path == std::path::Path::new("/tmp/gateway.toml")
+        ));
+        assert!(Cli::try_parse_from(["openshell-gateway", "config", "migrate-mtls"]).is_err());
     }
 
     #[test]

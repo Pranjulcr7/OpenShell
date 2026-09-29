@@ -4724,6 +4724,7 @@ dependencies = [
  "tokio-stream",
  "tokio-tungstenite 0.26.2",
  "toml",
+ "toml_edit",
  "tonic",
  "tonic-prost-build",
  "tower",

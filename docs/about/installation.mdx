@@ -112,6 +112,13 @@ sudo snap install openshell
 
 The snap does not migrate existing Debian, RPM, or Homebrew installs. Remove any existing installation first, then rerun the script with `OPENSHELL_INSTALL_METHOD=snap OPENSHELL_ACK_BREAKING_UPGRADE=1`.
 
+Snap refresh preserves custom settings and comments in `gateway.toml`, including
+`allow_driver_config`. When migrating a legacy configuration, it changes only
+`openshell.gateway.disable_tls = true` and
+`openshell.gateway.auth.allow_unauthenticated_users = true` to `false` to require
+TLS and authenticated access. Secure configurations are left unchanged. Invalid
+TOML fails the refresh hook without replacing the original file.
+
 The gateway runs as a system service at `https://127.0.0.1:17670` and reads `/var/snap/openshell/common/gateway.toml`. It requires a client certificate. The install script copies that certificate to the installing user's Snap state and registers the gateway automatically. If you installed with `sudo snap install openshell`, give each trusted user the certificate and register the gateway from that user's account:
 
 ```shell
