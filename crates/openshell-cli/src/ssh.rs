@@ -206,6 +206,15 @@ fn ssh_base_command(proxy_command: &str) -> Command {
         .arg("GlobalKnownHostsFile=/dev/null")
         .arg("-o")
         .arg(format!("LogLevel={ssh_log_level}"))
+        // Every session must run its own sandbox-scoped ProxyCommand. All CLI
+        // sessions use the host "sandbox", so a user-configured control socket
+        // could otherwise reuse a connection to a different sandbox.
+        .arg("-o")
+        .arg("ControlMaster=no")
+        .arg("-o")
+        .arg("ControlPath=none")
+        .arg("-o")
+        .arg("ControlPersist=no")
         // Detect a dead relay within ~45s. The relay rides on a TCP connection
         // that the client has no way to observe silently dropping (gateway
         // restart, supervisor restart, cluster failover), so fall back to
@@ -839,12 +848,6 @@ pub async fn sandbox_forward(
 fn ssh_forward_command(proxy_command: &str, sandbox_id: &str, spec: &ForwardSpec) -> Command {
     let mut command = ssh_base_command(proxy_command);
     command
-        .arg("-o")
-        .arg("ControlMaster=no")
-        .arg("-o")
-        .arg("ControlPath=none")
-        .arg("-o")
-        .arg("ControlPersist=no")
         .arg("-o")
         .arg("ForkAfterAuthentication=no")
         .arg("-N")
@@ -2045,7 +2048,7 @@ fn render_ssh_config(gateway: &str, name: &str, workspace: &str) -> String {
     );
     let host_alias = host_alias(name, workspace);
     format!(
-        "Host {host_alias}\n    User sandbox\n    StrictHostKeyChecking no\n    UserKnownHostsFile /dev/null\n    GlobalKnownHostsFile /dev/null\n    LogLevel ERROR\n    ServerAliveInterval 15\n    ServerAliveCountMax 3\n    ProxyCommand {proxy_cmd}\n"
+        "Host {host_alias}\n    User sandbox\n    StrictHostKeyChecking no\n    UserKnownHostsFile /dev/null\n    GlobalKnownHostsFile /dev/null\n    LogLevel ERROR\n    ControlMaster no\n    ControlPath none\n    ControlPersist no\n    ServerAliveInterval 15\n    ServerAliveCountMax 3\n    ProxyCommand {proxy_cmd}\n"
     )
 }
 
@@ -2487,6 +2490,92 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn base_ssh_command_overrides_user_multiplexing() {
+        let _guard = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("ssh_config");
+        fs::write(
+            &config,
+            format!(
+                "Host *\n  ControlMaster auto\n  ControlPath {}/mux-%C\n  ControlPersist 10m\n",
+                dir.path().display()
+            ),
+        )
+        .unwrap();
+
+        for sandbox in ["first", "second"] {
+            let proxy = format!("openshell ssh-proxy --sandbox {sandbox}");
+            let command = ssh_base_command(&proxy);
+            let output = Command::new("ssh")
+                .arg("-F")
+                .arg(&config)
+                .arg("-G")
+                .args(command.get_args())
+                .arg("sandbox")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "ssh -G failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let effective = String::from_utf8(output.stdout).unwrap();
+            assert_ssh_multiplexing_disabled(&effective);
+            assert!(
+                effective
+                    .lines()
+                    .any(|line| line == format!("proxycommand {proxy}"))
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn editor_ssh_config_overrides_user_multiplexing() {
+        let _guard = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("ssh_config");
+        fs::write(
+            &config,
+            format!(
+                "{}Host *\n  ControlMaster auto\n  ControlPath {}/shared-mux\n  ControlPersist 10m\n",
+                render_ssh_config("my-gw", "demo", "default"),
+                dir.path().display()
+            ),
+        )
+        .unwrap();
+        let output = Command::new("ssh")
+            .arg("-F")
+            .arg(&config)
+            .arg("-G")
+            .arg(host_alias("demo", "default"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "ssh -G failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_ssh_multiplexing_disabled(&String::from_utf8(output.stdout).unwrap());
+    }
+
+    #[cfg(unix)]
+    fn assert_ssh_multiplexing_disabled(effective: &str) {
+        assert!(effective.lines().any(|line| line == "controlmaster false"));
+        assert!(effective.lines().any(|line| line == "controlpersist no"));
+        assert!(
+            !effective
+                .lines()
+                .any(|line| line.starts_with("controlpath ") && line != "controlpath none")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn forward_ssh_command_overrides_user_multiplexing_and_forking() {
         let _guard = TEST_ENV_LOCK
             .lock()
@@ -2520,17 +2609,11 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         let effective = String::from_utf8(output.stdout).unwrap();
-        assert!(effective.lines().any(|line| line == "controlmaster false"));
-        assert!(effective.lines().any(|line| line == "controlpersist no"));
+        assert_ssh_multiplexing_disabled(&effective);
         assert!(
             effective
                 .lines()
                 .any(|line| line == "forkafterauthentication no")
-        );
-        assert!(
-            !effective
-                .lines()
-                .any(|line| { line.starts_with("controlpath ") && line != "controlpath none" })
         );
     }
 
