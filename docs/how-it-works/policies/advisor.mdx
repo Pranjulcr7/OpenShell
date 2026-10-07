@@ -307,11 +307,14 @@ openshell logs <sandbox-name> --since 10m
 Look for the denied request (`HTTP:<method> ... DENIED`) or blocked connection
 (`NET:OPEN ... DENIED`), then `CONFIG:PROPOSED`, `CONFIG:APPROVED` or
 `CONFIG:REJECTED`, `CONFIG:LOADED`, and the retried request. `CONFIG:PROPOSED`
-appears only for proposals from the agent, and `CONFIG:REJECTED` appears only
-if the agent was waiting for the decision. An automatic approval's
-`CONFIG:APPROVED` entry includes `auto:true`, the proposal's `source`
-(`agent_authored`, or `mechanistic` for OpenShell's own drafts), and
-`resolved_from`, which shows where the approval mode setting came from.
+appears only for proposals from the agent. The gateway logs `CONFIG:REJECTED`
+for every rejected proposal, whether or not the agent was waiting. Its OCSF
+record names the reviewer in `actor`, and an automatic rejection, such as a
+proposal replaced by a newer one for the same endpoint, includes `auto:true`.
+An automatic approval's `CONFIG:APPROVED` entry includes `auto:true`, the
+proposal's `source` (`agent_authored`, or `mechanistic` for OpenShell's own
+drafts), and `resolved_from`, which shows where the approval mode setting came
+from.
 
 ## Next Steps
 
