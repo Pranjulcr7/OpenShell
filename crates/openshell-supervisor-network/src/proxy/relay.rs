@@ -17,6 +17,9 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 type DynamicCredentials = Arc<std::sync::RwLock<HashMap<String, ProviderProfileCredential>>>;
 
+#[cfg(test)]
+mod token_grants;
+
 enum PreparedHttpPolicy {
     Inspect {
         configs: Vec<crate::l7::L7EndpointConfig>,

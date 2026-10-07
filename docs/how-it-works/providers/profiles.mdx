@@ -557,6 +557,10 @@ The refresh attaches to the primary credential (`access_key_id`). Each reference
 
 `token_grant` belongs to one credential declaration. When a sandbox with the provider attached sends HTTP traffic to a matching profile endpoint, the supervisor resolves the dynamic credentials, caches each returned access token separately, and injects them before forwarding the request upstream. Use `auth_style: bearer` to inject `Authorization: Bearer <token>`, or `auth_style: header` with `header_name` to inject the raw access token into a custom header. Token grants do not support `query` or `path` placement.
 
+REST, GraphQL, JSON-RPC, and MCP requests use the same credential preparation after policy admission and request middleware. This also applies when multiple endpoint paths share a host and port: credentials are selected for each request, including requests on a reused connection. A provider update during credential preparation prevents the stale request from being forwarded. Raw `tls: skip` tunnels do not inject credentials.
+
+For MCP, tool rules and middleware transformations are checked before obtaining a token. A denied operation rejects the entire batch under `enforcement: enforce`, for protocol revisions that support batching. Admitted `tools/list`, initialization, and receive-stream requests authenticate too; allowing `tools/list` does not filter the tools in its response. Grant or injection failures prevent upstream forwarding.
+
 Declare multiple credentials with different destination headers when one request needs independently issued tokens. Each credential keeps its own token endpoint, audience, scopes, and cache lifetime. For example, this profile sends a service bearer token and a separate workload token on the same inspected request:
 
 ```yaml

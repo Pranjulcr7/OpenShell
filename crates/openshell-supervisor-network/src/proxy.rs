@@ -9,6 +9,7 @@ mod relay;
 
 use crate::identity::{BinaryIdentityCache, SuppliedIdentityError};
 use crate::l7::tls::ProxyTlsState;
+use crate::l7::token_grant_injection::revision_scoped_dynamic_credentials;
 use crate::opa::{NetworkAction, OpaEngine, PolicyGenerationGuard};
 #[cfg(any(target_os = "linux", test))]
 use crate::policy_dns::PolicyEndpointId;
@@ -28,7 +29,9 @@ use openshell_core::net::{
     set_tcp_nodelay_best_effort,
 };
 use openshell_core::policy::ProxyPolicy;
-use openshell_core::provider_credentials::{ProviderCredentialSnapshot, ProviderCredentialState};
+#[cfg(test)]
+use openshell_core::provider_credentials::ProviderCredentialSnapshot;
+use openshell_core::provider_credentials::ProviderCredentialState;
 use openshell_core::secrets::{self, SecretResolver, rewrite_header_line_checked};
 #[cfg(test)]
 use openshell_isolation_interface::contract::ExecutableIdentity as ContractExecutableIdentity;
@@ -213,27 +216,6 @@ pub(crate) const HOST_GATEWAY_ALIASES: &[&str] = &[
     "host.containers.internal",
     "host.docker.internal",
 ];
-
-fn revision_scoped_dynamic_credentials(
-    snapshot: &ProviderCredentialSnapshot,
-) -> std::collections::HashMap<String, openshell_core::proto::ProviderProfileCredential> {
-    snapshot
-        .dynamic_credentials
-        .iter()
-        .map(|(key, credential)| {
-            let scoped_key = key.rsplit_once('\t').map_or_else(
-                || format!("rev:{}\t{key}", snapshot.revision),
-                |(endpoint_selector, provider_credential)| {
-                    format!(
-                        "{endpoint_selector}\trev:{}\t{provider_credential}",
-                        snapshot.revision
-                    )
-                },
-            );
-            (scoped_key, credential.clone())
-        })
-        .collect()
-}
 
 /// Cloud instance metadata IPs that are NEVER exempted from SSRF blocking,
 /// even when they coincidentally match a host-gateway alias resolution.
@@ -6362,6 +6344,26 @@ async fn handle_forward_proxy(
     if middleware_session.is_some() {
         websocket_extensions = crate::l7::rest::WebSocketExtensionMode::PermessageDeflate;
     }
+    // Pin static and dynamic preparation to the same request revision before
+    // the grant can await. The guard below rejects a refresh during the grant.
+    let endpoint_credentials = endpoint_credentials_for_request(
+        l7_ctx.provider_credentials.as_ref(),
+        l7_ctx.secret_resolver.clone(),
+        &host_lc,
+        port,
+        &path,
+    );
+    l7_ctx.provider_credential_revision = endpoint_credentials.revision;
+    let secret_resolver = endpoint_credentials.resolver;
+    let credential_generation = match (
+        l7_ctx.provider_credentials.as_ref(),
+        endpoint_credentials.revision,
+    ) {
+        (Some(state), Some(revision)) => Some(crate::l7::rest::CredentialGenerationGuard::new(
+            state, revision,
+        )),
+        _ => None,
+    };
     forward_request_bytes = match inject_token_grant_for_forward_request(
         method,
         &upstream_target,
@@ -6395,27 +6397,6 @@ async fn handle_forward_proxy(
             .await?;
             return Ok(());
         }
-    };
-    // Static credentials are intentionally acquired only after every
-    // asynchronous admission step. Holding an endpoint-scoped resolver across
-    // middleware or token-grant awaits would let a revoked generation reach
-    // the upstream.
-    let endpoint_credentials = endpoint_credentials_for_request(
-        l7_ctx.provider_credentials.as_ref(),
-        l7_ctx.secret_resolver.clone(),
-        &host_lc,
-        port,
-        &path,
-    );
-    let secret_resolver = endpoint_credentials.resolver;
-    let credential_generation = match (
-        l7_ctx.provider_credentials.as_ref(),
-        endpoint_credentials.revision,
-    ) {
-        (Some(state), Some(revision)) => Some(crate::l7::rest::CredentialGenerationGuard::new(
-            state, revision,
-        )),
-        _ => None,
     };
     if let Some(guard) = credential_generation {
         guard.ensure_current()?;

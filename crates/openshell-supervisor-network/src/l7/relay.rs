@@ -573,6 +573,43 @@ where
     C: AsyncRead + AsyncWrite + Unpin,
     U: AsyncRead + AsyncWrite + Unpin,
 {
+    // CONNECT HTTP relays reach this boundary only after policy admission,
+    // middleware, and revalidation of any transformed request.
+    if let Some(guard) = options.generation_guard
+        && close_if_stale(guard, ctx)
+    {
+        return Ok(None);
+    }
+    if let Some(guard) = options.credential_generation
+        && let Err(error) = guard.ensure_current()
+    {
+        if let Some(observer) = observer {
+            observer.observe_credential_failure(false);
+        }
+        return Err(error);
+    }
+    let authenticated_request;
+    let request = match crate::l7::token_grant_injection::prepare_headers(request, ctx).await {
+        Ok(Some(raw_header)) => {
+            authenticated_request = crate::l7::provider::L7Request {
+                action: request.action.clone(),
+                target: request.target.clone(),
+                query_params: request.query_params.clone(),
+                raw_header,
+                body_length: request.body_length,
+            };
+            &authenticated_request
+        }
+        Ok(None) => request,
+        Err(error) => {
+            if let Some(observer) = observer {
+                observer.observe_credential_failure(false);
+            }
+            warn!(host = %ctx.host, port = ctx.port, error = %error, "Token grant failed in HTTP relay");
+            write_bad_gateway_response(client).await?;
+            return Ok(None);
+        }
+    };
     match Box::pin(
         crate::l7::rest::relay_http_request_with_response_middleware_guarded_observed(
             request,
@@ -2068,26 +2105,12 @@ where
             } else {
                 None
             };
-            let req_with_auth =
-                match crate::l7::token_grant_injection::inject_if_needed(req, ctx).await {
-                    Ok(req) => req,
-                    Err(e) => {
-                        warn!(
-                            host = %ctx.host,
-                            port = ctx.port,
-                            error = %e,
-                            "Token grant failed in L7 relay"
-                        );
-                        write_bad_gateway_response(client).await?;
-                        return Ok(());
-                    }
-                };
-            let scoped_ctx = scoped_context_for_request(ctx, &req_with_auth);
+            let scoped_ctx = scoped_context_for_request(ctx, &req);
             let ctx = scoped_ctx.as_ref().unwrap_or(ctx);
 
             // Forward request to upstream and relay response
             let outcome_result = relay_http_request_with_credential_rejection(
-                &req_with_auth,
+                &req,
                 client,
                 upstream,
                 crate::l7::rest::RelayRequestOptions {
@@ -2112,7 +2135,7 @@ where
                 },
                 ctx,
                 Some(http_response_middleware_relay(
-                    &req_with_auth,
+                    &req,
                     ctx,
                     "https",
                     &request_id,
@@ -2174,7 +2197,7 @@ where
                         ctx,
                         websocket_request,
                         &redacted_target,
-                        &req_with_auth.query_params,
+                        &req.query_params,
                         Some(engine),
                     );
                     options.websocket.permessage_deflate = websocket_permessage_deflate;
@@ -3460,32 +3483,18 @@ where
             req
         };
 
-        let req_with_auth = match crate::l7::token_grant_injection::inject_if_needed(req, ctx).await
-        {
-            Ok(req) => req,
-            Err(e) => {
-                warn!(
-                    host = %ctx.host,
-                    port = ctx.port,
-                    error = %e,
-                    "Token grant failed in passthrough relay"
-                );
-                write_bad_gateway_response(client).await?;
-                return Ok(());
-            }
-        };
-        let scoped_ctx = scoped_context_for_request(ctx, &req_with_auth);
+        let scoped_ctx = scoped_context_for_request(ctx, &req);
         let ctx = scoped_ctx.as_ref().unwrap_or(ctx);
         let resolver = ctx.secret_resolver.as_deref();
         let response_middleware = response_selection
             .as_ref()
-            .map(|exchange| exchange.response_relay(&req_with_auth, ctx, "http"));
+            .map(|exchange| exchange.response_relay(&req, ctx, "http"));
 
         // Forward request with credential rewriting and relay the response.
         // relay_http_request_with_resolver handles both directions: it sends
         // the request upstream and reads the response back to the client.
         let Some(outcome) = relay_http_request_with_credential_rejection(
-            &req_with_auth,
+            &req,
             client,
             upstream,
             crate::l7::rest::RelayRequestOptions {

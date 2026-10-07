@@ -6,7 +6,7 @@
 #[cfg(test)]
 mod multiple_grants;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -72,18 +72,36 @@ pub fn default_resolver() -> Arc<dyn TokenGrantResolver> {
     Arc::new(SpiffeTokenGrantResolver)
 }
 
+pub(crate) fn revision_scoped_dynamic_credentials(
+    snapshot: &openshell_core::provider_credentials::ProviderCredentialSnapshot,
+) -> HashMap<String, ProviderProfileCredential> {
+    snapshot
+        .dynamic_credentials
+        .iter()
+        .map(|(key, credential)| {
+            let scoped_key = key.rsplit_once('\t').map_or_else(
+                || format!("rev:{}\t{key}", snapshot.revision),
+                |(endpoint_selector, provider_credential)| {
+                    format!(
+                        "{endpoint_selector}\trev:{}\t{provider_credential}",
+                        snapshot.revision
+                    )
+                },
+            );
+            (scoped_key, credential.clone())
+        })
+        .collect()
+}
+
 /// Resolves one endpoint-bound grant per protected header before rewriting a request.
 ///
 /// Each header independently uses its most-specific matching binding. Every selected
 /// grant must succeed; callers must not forward the request when this returns an error.
-pub async fn inject_if_needed(req: L7Request, ctx: &L7EvalContext) -> Result<L7Request> {
+pub async fn prepare_headers(req: &L7Request, ctx: &L7EvalContext) -> Result<Option<Vec<u8>>> {
     let request_path = req.target.split('?').next().unwrap_or(req.target.as_str());
-    let credentials = match ctx.dynamic_credentials.as_ref() {
-        Some(dynamic_credentials) => {
-            let credentials = dynamic_credentials
-                .read()
-                .map_err(|_| miette!("dynamic credential snapshot unavailable"))?;
-            let candidates = credentials
+    let select = |credentials: &HashMap<String, ProviderProfileCredential>| {
+        select_token_grants(
+            credentials
                 .iter()
                 .filter_map(|(key, cred)| {
                     let score =
@@ -92,13 +110,28 @@ pub async fn inject_if_needed(req: L7Request, ctx: &L7EvalContext) -> Result<L7R
                         .is_some()
                         .then(|| (score, key.clone(), cred.clone()))
                 })
-                .collect();
-            select_token_grants(candidates)?
+                .collect(),
+        )
+    };
+    let credentials = if let Some(state) = ctx.provider_credentials.as_ref() {
+        let snapshot = state.snapshot();
+        let selected = select(&revision_scoped_dynamic_credentials(&snapshot))?;
+        if !selected.is_empty() && ctx.provider_credential_revision != Some(snapshot.revision) {
+            return Err(miette!(
+                "provider credential generation changed before token grant"
+            ));
         }
-        None => Vec::new(),
+        selected
+    } else if let Some(credentials) = ctx.dynamic_credentials.as_ref() {
+        let credentials = credentials
+            .read()
+            .map_err(|_| miette!("dynamic credential snapshot unavailable"))?;
+        select(&credentials)?
+    } else {
+        Vec::new()
     };
     if credentials.is_empty() {
-        return Ok(req);
+        return Ok(None);
     }
     let resolver = ctx
         .token_grant_resolver
@@ -150,9 +183,13 @@ pub async fn inject_if_needed(req: L7Request, ctx: &L7EvalContext) -> Result<L7R
         }
     }
 
-    let mut raw_header = req.raw_header;
+    let mut raw_header = None;
     for (name, value) in headers {
-        raw_header = inject_header(&raw_header, &name, &value)?;
+        raw_header = Some(inject_header(
+            raw_header.as_deref().unwrap_or(&req.raw_header),
+            &name,
+            &value,
+        )?);
     }
     for (provider_key, _) in credentials {
         ocsf_emit!(
@@ -175,7 +212,14 @@ pub async fn inject_if_needed(req: L7Request, ctx: &L7EvalContext) -> Result<L7R
                 .build()
         );
     }
-    Ok(L7Request { raw_header, ..req })
+    Ok(raw_header)
+}
+
+pub async fn inject_if_needed(req: L7Request, ctx: &L7EvalContext) -> Result<L7Request> {
+    match prepare_headers(&req, ctx).await? {
+        Some(raw_header) => Ok(L7Request { raw_header, ..req }),
+        None => Ok(req),
+    }
 }
 
 fn select_token_grants(
