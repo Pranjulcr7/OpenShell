@@ -72,7 +72,7 @@ pub fn default_resolver() -> Arc<dyn TokenGrantResolver> {
     Arc::new(SpiffeTokenGrantResolver)
 }
 
-pub(crate) fn revision_scoped_dynamic_credentials(
+pub fn revision_scoped_dynamic_credentials(
     snapshot: &openshell_core::provider_credentials::ProviderCredentialSnapshot,
 ) -> HashMap<String, ProviderProfileCredential> {
     snapshot
@@ -1001,7 +1001,7 @@ mod tests {
         let req = L7Request {
             action: "GET".to_string(),
             target: "/v1/projects".to_string(),
-            query_params: std::collections::HashMap::new(),
+            query_params: HashMap::new(),
             raw_header: b"GET /v1/projects HTTP/1.1\r\nHost: api.example.com\r\n\r\n".to_vec(),
             body_length: BodyLength::None,
         };
@@ -1039,7 +1039,7 @@ mod tests {
         let req = L7Request {
             action: "GET".to_string(),
             target: "/v1/projects".to_string(),
-            query_params: std::collections::HashMap::new(),
+            query_params: HashMap::new(),
             raw_header: b"GET /v1/projects HTTP/1.1\r\nHost: api.example.com\r\n\r\n".to_vec(),
             body_length: BodyLength::None,
         };
@@ -1078,7 +1078,7 @@ mod tests {
         let req = L7Request {
             action: "GET".to_string(),
             target: "/v1/projects".to_string(),
-            query_params: std::collections::HashMap::new(),
+            query_params: HashMap::new(),
             raw_header: b"GET /v1/projects HTTP/1.1\r\nHost: api.example.com\r\n\r\n".to_vec(),
             body_length: BodyLength::None,
         };
